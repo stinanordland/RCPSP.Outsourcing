@@ -69,8 +69,7 @@ H = 50
 T = range(1, H + 1)
 
 # Set of projects (I)
-I = [1, 2, 3, 4, 5, 6, 7, 8, 9]
-
+I = [1, 2, 3, 4, 5, 6]
 # Number of jobs (J)
 J_common = sorted(operations_df["OP_NUM"].unique())
 
@@ -240,12 +239,9 @@ for i in I:
             start_m = pulp.lpSum(t * x[(i, m, t)] for t in feasible_t[(i, m)])
             if m in J_bar[i]:
                 start_m += pulp.lpSum(t * y[(i, m, t)] for t in feasible_t[(i, m)])
-
-                # If predecessor m is outsourced, successor must wait one extra bucket
-                if m in J_bar[i]:
-                    model += start_m + z[(i, m)] <= start_j
-                else:
-                    model += start_m <= start_j
+                model += start_m + z[(i, m)] <= start_j
+            else:
+                model += start_m <= start_j
 
 # Resource consumption cannot exceed resource availability
 for k in K:
@@ -300,7 +296,7 @@ model += pulp.lpSum(L[i] for i in I)
 # Defining solver settings
 # msg=0 silences the terminal; logPath writes all CBC output to the run log file
 solver = pulp.PULP_CBC_CMD(
-    msg=0,  
+    msg=0,
     timeLimit=200,
     options=["cuts on"],
     logPath=f"{log_dir}/Model_A.2_logfile_{timestamp}.log"
