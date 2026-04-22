@@ -300,7 +300,7 @@ model += pulp.lpSum(L[i] for i in I)
 # Defining solver settings
 # msg=0 silences the terminal; logPath writes all CBC output to the run log file
 solver = pulp.PULP_CBC_CMD(
-    msg=0,  # 👈 suppress terminal output
+    msg=0,  
     timeLimit=200,
     options=["cuts on"],
     logPath=f"{log_dir}/Model_A.2_logfile_{timestamp}.log"
