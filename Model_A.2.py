@@ -69,7 +69,7 @@ H = 50
 T = range(1, H + 1)
 
 # Set of projects (I)
-I = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+I = [1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 # Number of jobs (J)
 J_common = sorted(operations_df["OP_NUM"].unique())
@@ -124,10 +124,7 @@ a = {
 
 # Jobs that may be outsourced
 O = {
-    2011, 2013, 7003, 2004, 1001, 2001, 2005, 2002, 3002, 1008, 2008,
-    4020, 7015, 2016, 1023, 1018, 1516, 6015, 4015, 3015, 2015, 1015,
-    2020, 1007, 1002, 1505, 6503, 6003, 4003, 3003, 2003, 1503, 1003,
-    4009, 1012, 1511, 1011
+    2011, 2013, 7003, 2004, 2001, 2005, 2002, 2008, 4020, 7015, 2016
 }
 
 missing_outsource_jobs = O - set(J_common)
@@ -153,16 +150,20 @@ jobs_by_resource = {
     for k in K
 }
 
+# Earliest possible bucket from precedence constraints
+# Matches same-bucket precedence logic used in the model (start_m <= start_j).
 ES = {j: 1 for j in J_common}
 changed = True
 while changed:
     changed = False
     for j in J_common:
         if P[j]:
-            es_new = 1 + max(ES[m] for m in P[j])
+            es_new = max(ES[m] for m in P[j])
             if es_new > ES[j]:
                 ES[j] = es_new
                 changed = True
+
+log(f"Max ES: {max(ES.values())}")
 
 # Feasible start buckets for each project-job pairing
 feasible_t = {
@@ -188,6 +189,13 @@ y_index = [(i, j, t) for i in I for j in J_bar[i] for t in feasible_t[(i, j)]]
 
 # Binary outsourced start-time variable (y^t_ij)
 y = pulp.LpVariable.dicts("y", y_index, cat="Binary")
+
+# Binary outsourcing decision: 1 if job j in project i is outsourced
+z = pulp.LpVariable.dicts(
+    "z",
+    ((i, j) for i in I for j in J_bar[i]),
+    cat="Binary"
+)
 
 #Quick test on whether outsourcing variables exist 
 print("Number of outsourcing variables:", len(y_index))
@@ -216,6 +224,11 @@ for i in I:
             pulp.lpSum(y[(i, j, t)] for t in feasible_t[(i, j)])
         ) == 1
 
+# Link outsourcing decision z to y
+for i in I:
+    for j in J_bar[i]:
+        model += pulp.lpSum(y[(i,j,t)] for t in feasible_t[(i,j)]) == z[(i,j)]
+
 # Precedence constraints
 for i in I:
     for j in J[i]:
@@ -229,11 +242,10 @@ for i in I:
                 start_m += pulp.lpSum(t * y[(i, m, t)] for t in feasible_t[(i, m)])
 
                 # If predecessor m is outsourced, successor must wait one extra bucket
-                lag_m = pulp.lpSum(y[(i, m, t)] for t in feasible_t[(i, m)])
-            else:
-                lag_m = 0
-
-            model += start_m + lag_m <= start_j
+                if m in J_bar[i]:
+                    model += start_m + z[(i, m)] <= start_j
+                else:
+                    model += start_m <= start_j
 
 # Resource consumption cannot exceed resource availability
 for k in K:
@@ -266,10 +278,14 @@ for i in I:
 for i in I:
     model += L[i] >= F[i] - D[i]
 
-#Symmetry constraints 
+# Symmetry breaking
 for i1, i2 in zip(list(I)[:-1], list(I)[1:]):
     if D[i1] == D[i2]:
         model += F[i1] <= F[i2]
+
+# Fallback symmetry break for projects without same-due-date pairs
+for i in range(1, len(I)):
+    model += F[i] <= F[i+1]
 
 # =========================
 # 7. OBJECTIVE
@@ -282,23 +298,14 @@ model += pulp.lpSum(L[i] for i in I)
 # =========================
 
 # Defining solver settings
-solver = pulp.PULP_CBC_CMD(msg=1, timeLimit=1860, options=["cuts on"])
+# msg=0 silences the terminal; logPath writes all CBC output to the run log file
+solver = pulp.PULP_CBC_CMD(
+    msg=0,  # 👈 suppress terminal output
+    timeLimit=200,
+    options=["cuts on"],
+    logPath=f"{log_dir}/Model_A.2_logfile_{timestamp}.log"
+)
 solution_status = model.solve(solver)
-
-if pulp.LpStatus[solution_status] in ["Optimal", "Feasible"]:
-    print("\nOUTSOURCED JOBS CHOSEN:")
-    found_any = False
-    for i in I:
-        for j in J_bar[i]:
-            for t in feasible_t[(i, j)]:
-                if (i, j, t) in y:
-                    val = pulp.value(y[(i, j, t)])
-                    if val is not None and val > 0.5:
-                        print(f"Project {i}, job {j}, bucket {t}")
-                        found_any = True
-
-    if not found_any:
-        print("None")
 
 # Convert status code to text and read objective value
 status_text = pulp.LpStatus[solution_status]
@@ -312,7 +319,7 @@ log("Total tardiness =", objective_value)
 # 9. OUTPUT
 # =========================
 
-output_file = f"{BASE}\\Clean_model_output_{timestamp}.txt"
+output_file = f"{BASE}\\Outsourcing_model_A_{timestamp}.txt"
 
 with open(output_file, "w", encoding="utf-8") as f:
 
