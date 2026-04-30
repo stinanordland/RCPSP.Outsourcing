@@ -1,2 +1,2 @@
 # RCPSP.Outsourcing
-## Model A including outsourcing 
+Model A including outsourcing 
