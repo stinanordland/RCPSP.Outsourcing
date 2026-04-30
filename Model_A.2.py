@@ -1,5 +1,6 @@
 import pandas as pd
-import pulp
+import gurobipy as gp
+from gurobipy import GRB
 from pathlib import Path
 from datetime import datetime
 
@@ -8,7 +9,7 @@ from datetime import datetime
 # =========================
 
 # Folder path
-BASE = r"C:\Users\stina\OneDrive\Documents\Master Science of Logistics\VÅR 2026\Data"
+BASE = r"C:\Users\stina\OneDrive\Documents\Master Science of Logistics\SPRING 2026\Data"
 
 # =========================
 # LOG FILE FOR THIS RUN
@@ -19,14 +20,12 @@ log_dir.mkdir(parents=True, exist_ok=True)
 
 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 log_file = log_dir / f"run_log_{timestamp}.txt"
+solver_log_file = log_dir / f"Model_A__{timestamp}.log"
 
 def log(*args, **kwargs):
     message = " ".join(str(arg) for arg in args)
 
-    # print to console
-    print(*args, **kwargs)
-
-    # append same message to this run's log file
+    # append same message to this run's log file only (no console output)
     with open(log_file, "a", encoding="utf-8") as f:
         print(message, file=f)
 
@@ -38,12 +37,14 @@ capacity_df = pd.read_excel(f"{BASE}\\BiweeklyResourceData.xlsx", sheet_name="Or
 # Remove rows with missing critical values
 operations_df = operations_df.dropna(subset=["OP_NUM", "PROCESS_ID", "TOTAL_PROCESS_TIME"]).copy()
 precedence_df = precedence_df.dropna(subset=["SEQ_NUM", "PRED_SEQ"]).copy()
-capacity_df = capacity_df.dropna(subset=["Period"]).copy()
 
-# Turn key columns into integer values
-operations_df[["ITEM_NUMBER", "OP_NUM", "PROCESS_ID"]] = operations_df[
-    ["ITEM_NUMBER", "OP_NUM", "PROCESS_ID"]
+# Convert only numeric columns
+operations_df[["ITEM_NUMBER", "OP_NUM"]] = operations_df[
+    ["ITEM_NUMBER", "OP_NUM"]
 ].apply(pd.to_numeric, errors="coerce").astype(int)
+
+# Keep PROCESS_ID as string
+operations_df["PROCESS_ID"] = operations_df["PROCESS_ID"].astype(str).str.strip()
 
 # Convert processing time to numeric values
 operations_df["TOTAL_PROCESS_TIME"] = pd.to_numeric(
@@ -55,8 +56,13 @@ precedence_df[["SEQ_NUM", "PRED_SEQ"]] = precedence_df[
     ["SEQ_NUM", "PRED_SEQ"]
 ].apply(pd.to_numeric, errors="coerce").astype(int)
 
-# Convert capacity period to integer values
-capacity_df["Period"] = pd.to_numeric(capacity_df["Period"], errors="coerce").astype(int)
+# Convert Period to numeric first
+capacity_df["Period"] = capacity_df["Period"].astype(str).str.strip()
+
+# Remove rows where Period is missing or blank
+capacity_df = capacity_df[
+    capacity_df["Period"].notna() & (capacity_df["Period"] != "")
+].copy()
 
 # =========================
 # 2. SETS
@@ -69,7 +75,8 @@ H = 50
 T = range(1, H + 1)
 
 # Set of projects (I)
-I = [1, 2, 3, 4, 5, 6]
+I = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+
 # Number of jobs (J)
 J_common = sorted(operations_df["OP_NUM"].unique())
 
@@ -137,7 +144,7 @@ J_bar = {i: [j for j in J[i] if j in O] for i in I}
 J_not_bar = {i: [j for j in J[i] if j not in O] for i in I}
 
 # Outsourcing capacity by bucket
-o = {t: 100 for t in T}
+o = {t: 5 for t in T}
 
 # =========================
 # 4. PREPROCESSING BLOCK
@@ -175,35 +182,43 @@ feasible_t = {
 # =========================
 
 # Creating the optimization model
-model = pulp.LpProblem("Multi_Project_Bucket_Scheduling", pulp.LpMinimize)
+env = gp.Env(empty=True)
+env.setParam("LogToConsole", 0)
+env.setParam("LogFile", str(solver_log_file))
+env.start()
+model = gp.Model("Multi_Project_Bucket_Scheduling", env=env)
 
 # Index sets for binary decision variable (x^t_ij)
 x_index = [(i, j, t) for i in I for j in J[i] for t in feasible_t[(i, j)]]
 
-# Binary start-time variable (x^t_ij)
-x = pulp.LpVariable.dicts("x", x_index, cat="Binary")
+# Binary start time variable (x^t_ij)
+x = {}
+for i, j, t in x_index:
+    x[(i, j, t)] = model.addVar(lb=0, ub=1, vtype=GRB.BINARY, name=f"x_{i}_{j}_{t}")
 
 # Index sets for outsourcing decision variable (y^t_ij)
 y_index = [(i, j, t) for i in I for j in J_bar[i] for t in feasible_t[(i, j)]]
 
-# Binary outsourced start-time variable (y^t_ij)
-y = pulp.LpVariable.dicts("y", y_index, cat="Binary")
+# Binary outsourcing decision variable (y^t_ij)
+y = {}
+for i, j, t in y_index:
+    y[(i, j, t)] = model.addVar(lb=0, ub=1, vtype=GRB.BINARY, name=f"y_{i}_{j}_{t}")
 
 # Binary outsourcing decision: 1 if job j in project i is outsourced
-z = pulp.LpVariable.dicts(
-    "z",
-    ((i, j) for i in I for j in J_bar[i]),
-    cat="Binary"
-)
-
-#Quick test on whether outsourcing variables exist 
-print("Number of outsourcing variables:", len(y_index))
+z = {}
+for i in I:
+    for j in J_bar[i]:
+        z[(i, j)] = model.addVar(vtype=GRB.BINARY, name=f"z_{i}_{j}")
 
 # Project completion time of project i
-F = pulp.LpVariable.dicts("F", I, lowBound=0, upBound=H)
+F = {}
+for i in I:
+    F[i] = model.addVar(lb=0, ub=H, vtype=GRB.INTEGER, name=f"F_{i}")
 
 # Tardiness time of project i
-L = pulp.LpVariable.dicts("L", I, lowBound=0, upBound=H)
+L = {}
+for i in I:
+    L[i] = model.addVar(lb=0, ub=H, vtype=GRB.INTEGER, name=f"L_{i}")
 
 # =========================
 # 6. CONSTRAINTS
@@ -212,104 +227,125 @@ L = pulp.LpVariable.dicts("L", I, lowBound=0, upBound=H)
 # Each non-outsourcable job must start exactly once inhouse
 for i in I:
     for j in J_not_bar[i]:
-        model += pulp.lpSum(x[(i, j, t)] for t in feasible_t[(i, j)]) == 1
+        model.addConstr(
+            gp.quicksum(x[(i, j, t)] for t in feasible_t[(i, j)]) == 1
+        )
 
 # Each outsourceable job must start exactly once:
 # either inhouse or outsourced
 for i in I:
     for j in J_bar[i]:
-        model += (
-            pulp.lpSum(x[(i, j, t)] for t in feasible_t[(i, j)]) +
-            pulp.lpSum(y[(i, j, t)] for t in feasible_t[(i, j)])
-        ) == 1
+        model.addConstr(
+            gp.quicksum(x[(i, j, t)] for t in feasible_t[(i, j)]) +
+            gp.quicksum(y[(i, j, t)] for t in feasible_t[(i, j)])
+            == 1
+        )
 
 # Link outsourcing decision z to y
 for i in I:
     for j in J_bar[i]:
-        model += pulp.lpSum(y[(i,j,t)] for t in feasible_t[(i,j)]) == z[(i,j)]
+        model.addConstr(
+            gp.quicksum(y[(i, j, t)] for t in feasible_t[(i, j)]) == z[(i, j)]
+        )
 
 # Precedence constraints
 for i in I:
     for j in J[i]:
-        start_j = pulp.lpSum(t * x[(i, j, t)] for t in feasible_t[(i, j)])
+        start_j = gp.quicksum(t * x[(i, j, t)] for t in feasible_t[(i, j)])
         if j in J_bar[i]:
-            start_j += pulp.lpSum(t * y[(i, j, t)] for t in feasible_t[(i, j)])
+            start_j += gp.quicksum(t * y[(i, j, t)] for t in feasible_t[(i, j)])
 
         for m in P[j]:
-            start_m = pulp.lpSum(t * x[(i, m, t)] for t in feasible_t[(i, m)])
+            start_m = gp.quicksum(t * x[(i, m, t)] for t in feasible_t[(i, m)])
             if m in J_bar[i]:
-                start_m += pulp.lpSum(t * y[(i, m, t)] for t in feasible_t[(i, m)])
-                model += start_m + z[(i, m)] <= start_j
+                start_m += gp.quicksum(t * y[(i, m, t)] for t in feasible_t[(i, m)])
+                model.addConstr(start_m + z[(i, m)] <= start_j)
             else:
-                model += start_m <= start_j
+                model.addConstr(start_m <= start_j)
 
 # Resource consumption cannot exceed resource availability
 for k in K:
     for t in T:
-        model += pulp.lpSum(
-            cons * x[(i, j, t)]
-            for i in I
-            for j, cons in jobs_by_resource[k]
-            if t in feasible_t[(i, j)]
-        ) <= a[(k, t)]
+        model.addConstr(
+            gp.quicksum(
+                cons * x[(i, j, t)]
+                for i in I
+                for j, cons in jobs_by_resource[k]
+                if t in feasible_t[(i, j)]
+            ) <= a[(k, t)]
+        )
 
 # Outsourcing capacity cannot be exceeded
 for t in T:
-    model += pulp.lpSum(
-        y[(i, j, t)]
-        for i in I
-        for j in J_bar[i]
-        if (i, j, t) in y
-    ) <= o[t]
+    model.addConstr(
+        gp.quicksum(
+            y[(i, j, t)]
+            for i in I
+            for j in J_bar[i]
+            if (i, j, t) in y
+        ) <= o[t]
+    )
 
 # Project completion time must be greater than or equal to assigned time of every job
 for i in I:
     for j in J[i]:
-        expr = pulp.lpSum(t * x[(i, j, t)] for t in feasible_t[(i, j)])
+        expr = gp.quicksum(t * x[(i, j, t)] for t in feasible_t[(i, j)])
         if j in J_bar[i]:
-            expr += pulp.lpSum(t * y[(i, j, t)] for t in feasible_t[(i, j)])
-        model += F[i] >= expr
+            expr += gp.quicksum(t * y[(i, j, t)] for t in feasible_t[(i, j)])
+        model.addConstr(F[i] >= expr)
 
 # Tardiness shall only capture late completion
 for i in I:
-    model += L[i] >= F[i] - D[i]
+    model.addConstr(L[i] >= F[i] - D[i])
 
 # Symmetry breaking
 for i1, i2 in zip(list(I)[:-1], list(I)[1:]):
     if D[i1] == D[i2]:
-        model += F[i1] <= F[i2]
+        model.addConstr(F[i1] <= F[i2])
 
 # Fallback symmetry break for projects without same-due-date pairs
 for i in range(1, len(I)):
-    model += F[i] <= F[i+1]
+    model.addConstr(F[i] <= F[i+1])
 
 # =========================
 # 7. OBJECTIVE
 # =========================
 
-model += pulp.lpSum(L[i] for i in I)
+model.setObjective(gp.quicksum(L[i] for i in I), GRB.MINIMIZE)
 
 # =========================
 # 8. SOLVER
 # =========================
 
-# Defining solver settings
-# msg=0 silences the terminal; logPath writes all CBC output to the run log file
-solver = pulp.PULP_CBC_CMD(
-    msg=0,
-    timeLimit=200,
-    options=["cuts on"],
-    logPath=f"{log_dir}/Model_A.2_logfile_{timestamp}.log"
-)
-solution_status = model.solve(solver)
+# Update the model before solving
+model.update()
+
+# Set Gurobi parameters
+model.Params.TimeLimit = 3600
+model.Params.MIPGap = 0.0 
+model.Params.OutputFlag = 1
+model.Params.LogToConsole = 0
+
+# Optimize the model
+model.optimize()
 
 # Convert status code to text and read objective value
-status_text = pulp.LpStatus[solution_status]
-objective_value = pulp.value(model.objective)
+status_code = model.status
+if status_code == GRB.OPTIMAL:
+    status_text = "Optimal"
+elif status_code == GRB.SUBOPTIMAL:
+    status_text = "Feasible"
+else:
+    status_text = "Infeasible/Unbounded"
+
+objective_value = model.ObjVal if model.status in [GRB.OPTIMAL, GRB.SUBOPTIMAL] else None
 
 # Print summary results
 log("Status:", status_text)
-log("Total tardiness =", objective_value)
+if objective_value is not None:
+    log("Total tardiness =", objective_value)
+else:
+    log("Total tardiness = No solution found")
 
 # =========================
 # 9. OUTPUT
@@ -323,7 +359,6 @@ with open(output_file, "w", encoding="utf-8") as f:
         print(*args, file=f, **kwargs)
 
     def both(*args, **kwargs):
-        print(*args, **kwargs)
         out(*args, **kwargs)
 
     both("============================================================")
@@ -343,8 +378,8 @@ with open(output_file, "w", encoding="utf-8") as f:
         both("============================================================")
         for i in I:
             both(
-                f"Project {i:>2}: completion bucket = {pulp.value(F[i]):.2f}, "
-                f"tardiness = {pulp.value(L[i]):.2f}, due bucket = {D[i]}"
+                f"Project {i:>2}: completion bucket = {F[i].X:.2f}, "
+                f"tardiness = {L[i].X:.2f}, due bucket = {D[i]}"
             )
 
         both("\n============================================================")
@@ -359,7 +394,7 @@ with open(output_file, "w", encoding="utf-8") as f:
 
                 for t in feasible_t[(i, j)]:
                     if (i, j, t) in x:
-                        val_x = pulp.value(x[(i, j, t)])
+                        val_x = x[(i, j, t)].X
                         if val_x is not None and val_x > 0.5:
                             assigned[i][j] = {"bucket": t, "mode": "In-house"}
                             found = True
@@ -368,7 +403,7 @@ with open(output_file, "w", encoding="utf-8") as f:
                 if not found and j in O:
                     for t in feasible_t[(i, j)]:
                         if (i, j, t) in y:
-                            val_y = pulp.value(y[(i, j, t)])
+                            val_y = y[(i, j, t)].X
                             if val_y is not None and val_y > 0.5:
                                 assigned[i][j] = {"bucket": t, "mode": "Outsourced"}
                                 found = True
@@ -406,10 +441,10 @@ with open(output_file, "w", encoding="utf-8") as f:
             printed_any = False
             for t in T:
                 used = sum(
-                    cons * pulp.value(x[(i, j, t)])
+                    cons * x[(i, j, t)].X
                     for i in I
                     for j, cons in jobs_by_resource[k]
-                    if (i, j, t) in x and pulp.value(x[(i, j, t)]) is not None
+                    if (i, j, t) in x and x[(i, j, t)].X is not None
                 )
                 if used > 1e-6:
                     both(
@@ -459,3 +494,7 @@ with open(output_file, "w", encoding="utf-8") as f:
         both("\nNo integer-feasible solution was found.")
         both("Therefore there are no valid job-bucket assignments to print.")
         both("Any objective value shown is only the LP relaxation value.")
+
+log(f"Results written to: {output_file}")
+log(f"Run log written to: {log_file}")
+log(f"Gurobi solver log written to: {solver_log_file}")
